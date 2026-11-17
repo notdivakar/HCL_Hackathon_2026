@@ -6,7 +6,7 @@ Customer Loyalty & Engagement Assistant API (FastAPI + pandas).
 Pipeline for one customer:
   profile -> classify (rules) -> strategy (policy) -> offer (deterministic)
   -> pre-checks -> LLM / template draft -> guardrails -> human review
-  -> send gate -> MOCK outbox + audit log
+  -> send gate -> delivery (mock / smtp / resend) + audit log
 
 Run:  uvicorn backend.api:app --reload --port 8000
 """
@@ -32,10 +32,14 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from dotenv import load_dotenv
+load_dotenv(ROOT / ".env", override=True)
+
 from src.guardrails import (  # noqa: E402
     GuardrailResult, Violation, is_blocking, precheck_customer, send_gate, validate_email_draft,
 )
 from src.llm_orchestrator import generate_email  # noqa: E402
+from src.mailer import delivery_mode, resolve_recipient, send_smtp, send_resend  # noqa: E402
 from src.policy import load_policy, reminder_stage_for  # noqa: E402
 
 # --------------------------------------------------------------------------- #
@@ -381,7 +385,8 @@ def _run_checks(c: pd.Series, d: dict[str, Any], subject: str, body: str) -> Gua
 def health() -> dict[str, Any]:
     return {"status": "ok", "customers": len(customers_df), "offers": len(offers_df),
             "llm_enabled": bool(os.getenv("GROQ_API_KEY")), "sender": SENDER_EMAIL,
-            "today": TODAY.isoformat(), "policy_version": POLICY["policy_version"]}
+            "today": TODAY.isoformat(), "policy_version": POLICY["policy_version"],
+            "delivery_mode": delivery_mode(), "redirect_all_to": os.getenv("REDIRECT_ALL_TO") or None}
 
 
 @app.get("/segments")
@@ -505,22 +510,51 @@ def send(req: SendRequest) -> dict[str, Any]:
               edited=edited, gate=gate.to_dict())
         raise HTTPException(status_code=422, detail={"message": "Send blocked", **gate.to_dict()})
 
+    full_body = f"{req.body}\n\n---\n{d['footer']}"
+    mode = delivery_mode()
+    message_id = f"MOCK-{d['draft_id']}"
+    actual_to, redirected = d["to"], False
+    delivery = "MOCK (draft-only, not actually delivered)"
+
+    if mode in {"smtp", "resend"}:
+        actual_to, redirected = resolve_recipient(d["to"])
+        if actual_to.lower().endswith("@example.com"):
+            raise HTTPException(400, "Recipient is a fake @example.com address. Set REDIRECT_ALL_TO in .env "
+                                     "to your own test inbox.")
+        body_to_send = full_body
+        if redirected:
+            body_to_send = f"[DEMO] This email was meant for {d['to']}; redirected to the test inbox.\n\n{full_body}"
+        try:
+            if mode == "resend":
+                message_id = send_resend(actual_to, req.subject, body_to_send)
+            else:
+                message_id = send_smtp(SENDER_EMAIL, actual_to, req.subject, body_to_send)
+        except Exception as exc:  # SMTP / Resend / auth / network errors
+            audit("send_failed", draft_id=d["draft_id"], customer_id=d["customer_id"], reviewer=req.reviewer,
+                  mode=mode, error=str(exc), send_status="FAILED")
+            raise HTTPException(502, f"{mode.upper()} send failed: {exc}")
+        delivery = f"REAL via {mode.upper()} to {actual_to}" + (" (redirected test inbox)" if redirected else "")
+
     OUTBOX_DIR.mkdir(exist_ok=True)
     message = {
-        "message_id": f"MOCK-{d['draft_id']}",
+        "message_id": message_id,
         "from": SENDER_EMAIL,
         "to": d["to"],
+        "delivered_to": actual_to,
         "subject": req.subject,
-        "body": f"{req.body}\n\n---\n{d['footer']}",
+        "body": full_body,
         "sent_at": _now(),
-        "delivery": "MOCK (draft-only, not actually delivered)",
+        "delivery": delivery,
     }
-    (OUTBOX_DIR / f"{message['message_id']}.json").write_text(json.dumps(message, indent=2), encoding="utf-8")
+    safe_name = re.sub(r"[^A-Za-z0-9_-]", "", d["draft_id"])
+    (OUTBOX_DIR / f"{safe_name}.json").write_text(json.dumps(message, indent=2), encoding="utf-8")
     d["status"] = "SENT"
-    audit("sent", draft_id=d["draft_id"], customer_id=d["customer_id"], recipient_hash=_hash(d["to"]),
-          reviewer=req.reviewer, edited=edited, feedback=req.feedback, final_subject=req.subject,
-          final_body=req.body, send_status="MOCK_SENT", message_id=message["message_id"])
-    return {"status": "MOCK_SENT", "message_id": message["message_id"], "from": SENDER_EMAIL, "to": d["to"]}
+    status = "SENT" if mode != "mock" else "MOCK_SENT"
+    audit("sent", draft_id=d["draft_id"], customer_id=d["customer_id"], recipient_hash=_hash(actual_to),
+          redirected=redirected, reviewer=req.reviewer, edited=edited, feedback=req.feedback,
+          final_subject=req.subject, final_body=req.body, send_status=status, message_id=message_id)
+    return {"status": status, "message_id": message_id, "from": SENDER_EMAIL, "to": d["to"],
+            "delivered_to": actual_to, "delivery": delivery}
 
 
 @app.post("/reject-email")

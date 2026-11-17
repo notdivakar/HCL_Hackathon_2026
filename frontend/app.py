@@ -89,7 +89,8 @@ st.caption(
     f"Backend OK · {health['customers']} customers · {health['offers']} offers · "
     f"LLM: {'ON' if health['llm_enabled'] else 'OFF (template mode)'} · "
     f"Sender: {health['sender']} · Policy {health['policy_version']} · Today {health['today']} · "
-    "Delivery: MOCK only"
+    f"Delivery: {health['delivery_mode'].upper()}"
+    + (f" → all mail redirected to {health['redirect_all_to']}" if health.get("redirect_all_to") else "")
 )
 
 tab_review, tab_audit, tab_outbox = st.tabs(["Review drafts", "Audit log", "Mock outbox"])
@@ -260,12 +261,12 @@ with tab_review:
 
         feedback = st.text_input("Feedback / reason (optional for approve, required for reject)")
         a1, a2 = st.columns(2)
-        if a1.button("✅ Approve & send (mock)", disabled=not can_send, use_container_width=True):
+        if a1.button("✅ Approve & send", disabled=not can_send, use_container_width=True):
             ok, res = api_post("/send-email", {"draft_id": d["draft_id"], "subject": subj, "body": body,
                                                "reviewer": reviewer, "feedback": feedback})
             if ok:
                 d["status"] = "SENT"
-                st.success(f"Mock-sent from {res['from']} to {res['to']} (id {res['message_id']}). Nothing was really emailed.")
+                st.success(f"{res['status']}: from {res['from']} → {res['delivered_to']} · {res['delivery']}")
             else:
                 st.error(f"Send blocked: {res.get('detail')}")
         if a2.button("❌ Reject", disabled=status not in {"PENDING_REVIEW", "BLOCKED"}, use_container_width=True):
