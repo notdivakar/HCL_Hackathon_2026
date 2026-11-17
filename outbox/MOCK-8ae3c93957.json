@@ -1,0 +1,9 @@
+{
+  "message_id": "MOCK-8ae3c93957",
+  "from": "care@yourtelco.example",
+  "to": "5067-xjqfu@example.com",
+  "subject": "A quick reminder about bill B100057",
+  "body": "Hi Arjun,\n\nWe noticed your bill B100057 for $108.45, due on 2026-11-08, has not been paid yet. It may simply have slipped through. Please pay when you can, or reply if you need any help.\n\nWarm regards,\nThe Your Telco Team\n\n---\nIf you have already paid, please ignore this message. If you think this bill is incorrect, you can raise a dispute or get help any time by replying to this email or writing to support@yourtelco.example.",
+  "sent_at": "2026-11-17T08:43:56+00:00",
+  "delivery": "MOCK (draft-only, not actually delivered)"
+}
