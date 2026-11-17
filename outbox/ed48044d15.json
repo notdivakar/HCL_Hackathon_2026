@@ -1,0 +1,10 @@
+{
+  "message_id": "MOCK-ed48044d15",
+  "from": "hahabeproductive@gmail.com",
+  "to": "1066-jksgk@example.com",
+  "delivered_to": "1066-jksgk@example.com",
+  "subject": "Your upcoming bill details",
+  "body": "Hi Asha,\nJust a friendly heads\u2011up that your next bill (Bill ID: B100022) for $20.15 is due on 2026-11-17. When you\u2019re ready, you can make a payment at your convenience. If you have any questions or need assistance, just reply to this email and we\u2019ll be happy to help.\nWarm regards,\nThe Your Telco Team\n\n---\nIf you have already paid, please ignore this message. If you think this bill is incorrect, you can raise a dispute or get help any time by replying to this email or writing to support@yourtelco.example.",
+  "sent_at": "2026-11-17T10:02:33+00:00",
+  "delivery": "MOCK (draft-only, not actually delivered)"
+}

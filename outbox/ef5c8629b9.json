@@ -1,0 +1,10 @@
+{
+  "message_id": "MOCK-ef5c8629b9",
+  "from": "hahabeproductive@gmail.com",
+  "to": "5129-jlpis@example.com",
+  "delivered_to": "5129-jlpis@example.com",
+  "subject": "Something for you from Your Telco: 15% off",
+  "body": "Hi Kavya,\n\nThank you for being with us for 25 months. Get 15% off your next 2 monthly bills while you get back into your service.\n\nWarm regards,\nThe Your Telco Team\n\n---\nThis offer is personal to you and cannot be transferred or exchanged for cash. Applies to your next 2 bills. Redeem by 31 Jan 2027. One per customer. You are receiving this email because you opted in to communications from Your Telco. To stop receiving these emails, reply STOP or update your preferences in your account settings.",
+  "sent_at": "2026-11-17T09:56:56+00:00",
+  "delivery": "MOCK (draft-only, not actually delivered)"
+}
