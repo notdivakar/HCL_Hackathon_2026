@@ -243,6 +243,28 @@ def _process(customer_id: str) -> dict[str, Any]:
     }
 
 
+@app.get("/customers")
+def get_customers(limit: int = Query(50, ge=1, le=10_000),
+                  offset: int = Query(0, ge=0)) -> list[dict[str, Any]]:
+    """Customer list for the Streamlit frontend (frontend/app.py)."""
+    customers = []
+    page = customers_df.iloc[offset:offset + limit]
+    for i, (cid, row) in enumerate(page.iterrows(), start=offset + 1):
+        last_activity = row.get("paid_date")
+        if pd.isna(last_activity):
+            last_activity = row.get("last_login_date")
+        customers.append({
+            "id": i,
+            "customer_id": cid,  # use this with /process-customer
+            "name": row.get("first_name") or f"Customer {i}",
+            "segment": classify(row)["segment"],
+            "email": row.get("email") or f"customer{i}@example.com",
+            "last_purchase": last_activity.isoformat() if pd.notna(last_activity) else None,
+            "lifetime_value": f"${row['TotalCharges']:,.2f}",
+        })
+    return customers
+
+
 @app.get("/process-customer")
 def process_customer_get(customer_id: str = Query(..., description="e.g. 7590-VHVEG")):
     return _process(customer_id)
