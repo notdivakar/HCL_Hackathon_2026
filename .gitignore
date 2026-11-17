@@ -1,8 +1,19 @@
-.env
-.venv/
-venv/
+
+# Python cache files
 __pycache__/
+*.py[cod]
 *.pyc
+
+# Virtual environments
+.venv/
+.venv-1/
+
+# Environment variables and secrets
+.env
+**/.env
+
+# Generated logs
 logs/
-outbox/
-.streamlit/secrets.toml
+
+# System files
+.DS_Store
