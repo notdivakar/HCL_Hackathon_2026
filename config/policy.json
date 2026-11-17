@@ -1,0 +1,61 @@
+{
+  "policy_version": "policy-v1.0",
+  "company": {
+    "name": "Your Telco",
+    "sender_email": "care@yourtelco.example",
+    "support_email": "support@yourtelco.example"
+  },
+
+  "segments": {
+    "dormant_login_days": 60,
+    "declining_login_days": 30,
+    "declining_usage_pct": -25,
+    "loyal_min_tenure_months": 12,
+    "loyal_contracts": ["one year", "two year"],
+    "payment_statuses": ["due", "overdue"]
+  },
+
+  "strategies": {
+    "Payment Reminder": {"message_type": "reminder",     "objective": "Billing reminder",         "tone": "Set by reminder stage"},
+    "Loyal":            {"message_type": "offer",        "objective": "Appreciation + reward",    "tone": "Warm, grateful, celebratory"},
+    "Consistent":       {"message_type": "offer",        "objective": "Thank-you",                "tone": "Friendly, appreciative"},
+    "Declining":        {"message_type": "offer",        "objective": "Re-engagement offer",      "tone": "Helpful, encouraging, no pressure"},
+    "Dormant":          {"message_type": "offer",        "objective": "Win-back offer",           "tone": "Warm, welcoming, no guilt"}
+  },
+
+  "reminder_stages": [
+    {"stage": 0, "name": "Courteous heads-up", "min_days_overdue": 0,  "max_days_overdue": 0,
+     "tone": "Light, friendly heads-up that a bill is coming due. No pressure at all."},
+    {"stage": 1, "name": "Polite reminder",    "min_days_overdue": 1,  "max_days_overdue": 15,
+     "tone": "Polite and understanding. Assume it was an oversight."},
+    {"stage": 2, "name": "Firm reminder",      "min_days_overdue": 16, "max_days_overdue": 30,
+     "tone": "Clear and firm but respectful. Ask the customer to pay or contact support."},
+    {"stage": 3, "name": "Final reminder",     "min_days_overdue": 31, "max_days_overdue": 100000,
+     "tone": "Serious and direct, still courteous. State this is a final reminder and invite them to contact support for help."}
+  ],
+
+  "contact_rules": {
+    "max_contacts_last_30d": 3,
+    "min_days_since_last_contact": 7,
+    "applies_to": ["offer"]
+  },
+
+  "blocked_language": {
+    "all": [
+      "legal action", "lawsuit", "court", "collection agency", "collections agency",
+      "credit score", "credit bureau", "police", "arrest", "blacklist", "shame",
+      "guaranteed", "act now", "last chance", "urgent", "!!!", "churn", "risk score",
+      "propensity", "segment"
+    ],
+    "reminder_stage_below_3": ["final notice", "final reminder", "final warning"],
+    "reminder_all": ["disconnect", "terminate", "cut off", "penalty", "late fee"]
+  },
+
+  "footers": {
+    "offer": "This offer is personal to you and cannot be transferred or exchanged for cash. {terms} You are receiving this email because you opted in to communications from {company}. To stop receiving these emails, reply STOP or update your preferences in your account settings.",
+    "reminder": "If you have already paid, please ignore this message. If you think this bill is incorrect, you can raise a dispute or get help any time by replying to this email or writing to {support_email}.",
+    "no_offer": "You are receiving this email because you opted in to communications from {company}. To stop receiving these emails, reply STOP or update your preferences in your account settings."
+  },
+
+  "protected_attributes": ["gender", "SeniorCitizen", "Partner", "Dependents"]
+}

@@ -1,104 +1,92 @@
 """
-Personalized retention/loyalty email generation using Groq via LangChain.
+Email generation (owner: feature-llm).
 
-The LLM writes only the greeting and body copy. Facts (offer value, terms,
-balances) come from the data. The disclaimer is added in code after
-generation, so the model cannot leave it out or change it. A check rejects
-drafts that invent numbers, use banned language, or leak internal labels.
-If no draft passes, a fixed template email is returned instead.
+The LLM writes ONLY the subject and the body copy. Everything factual
+(offer value, terms, amount, due date, bill ID) comes from verified data,
+and the footer (disclaimer / dispute path) is appended in code so the model
+cannot drop it.
+
+Message types:
+  offer     -> appreciation / reward / re-engagement with ONE approved offer
+  no_offer  -> thank-you or check-in when no offer is eligible
+  reminder  -> billing reminder; tone set by reminder stage 0-3
+
+If GROQ_API_KEY is not set, or the model fails validation twice, a fixed,
+pre-approved template is used instead (source = "template").
 """
+
+from __future__ import annotations
 
 import json
 import os
 import re
 from typing import Any, Mapping
 
-from langchain.prompts import ChatPromptTemplate
-from langchain_groq import ChatGroq
 from pydantic import BaseModel, Field
 
-# --------------------------------------------------------------------------- #
-# Configuration
-# --------------------------------------------------------------------------- #
+from src.policy import load_policy
+
+try:  # load .env if python-dotenv is installed
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+POLICY = load_policy()
+COMPANY_NAME = os.getenv("COMPANY_NAME", POLICY["company"]["name"])
+SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL", POLICY["company"]["support_email"])
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-COMPANY_NAME = os.getenv("COMPANY_NAME", "Your Telco")
+PROMPT_VERSION = "prompt-v2.0"
+TEMPLATE_VERSION = "template-v2.0"
 MAX_ATTEMPTS = 2
 SUBJECT_MAX_CHARS = 70
 BODY_MAX_WORDS = 160
 
-STANDARD_DISCLAIMER = (
-    "This offer is personal to you and cannot be transferred or exchanged for cash. "
-    "{terms} "
-    "You are receiving this email because you opted in to communications from {company}. "
-    "To stop receiving these emails, reply STOP or update your preferences in your account settings."
-)
-
-BANNED_PHRASES = [
-    "churn", "risk score", "at risk", "segment", "propensity", "final notice",
-    "legal action", "collections", "suspend", "disconnect", "penalty",
-    "act now", "last chance", "urgent", "guaranteed", "!!!",
-]
-
-# Keys we never expose to the model (internal analytics / PII not needed for copy).
-INTERNAL_FIELDS = {
-    "Churn", "customerID", "email", "bill_id", "last_campaign_id",
-    "contacts_last_30d", "usage_change_pct", "eligible_segments",
-}
-
 
 class EmailDraft(BaseModel):
     subject: str = Field(description="Email subject line, max 70 characters, no emojis.")
-    body: str = Field(description="Email body (greeting through sign-off), plain text, no disclaimer.")
+    body: str = Field(description="Email body from greeting to sign-off, plain text, no footer.")
 
 
 # --------------------------------------------------------------------------- #
-# Prompt
+# Prompts
 # --------------------------------------------------------------------------- #
 SYSTEM_PROMPT = """You are a customer communications writer for {company}, a telecom provider.
-You write short, warm, professional, plain-text emails.
+You write short, plain-text emails that a human reviewer will check before sending.
 
-STRICT RULES (any violation makes the email unusable):
-1. Tone: friendly, appreciative, respectful, calm. Never pushy, alarming, guilt-inducing, or salesy.
-2. Use ONLY the facts provided in CUSTOMER and OFFER. Do not invent amounts, dates, percentages,
-   plan names, services, or benefits. Quote the offer value exactly as given: "{offer_value}".
-3. Never mention internal terms: churn, risk, segment, score, propensity, analytics, usage drop.
-4. Never use urgency or pressure language ("act now", "last chance", "urgent", "final notice").
-5. {balance_rule}
-6. Do NOT write any disclaimer, terms, legal text, or unsubscribe text. That is appended automatically.
-7. Subject: max {subject_max} characters, no emojis, no ALL CAPS, no exclamation marks.
-8. Body: max {body_max} words. Start with "Hi {first_name}," and end with
-   "Warm regards,\\nThe {company} Team". Plain text only, no markdown, no placeholders like [Name].
-9. Do not include links or URLs.
+GOAL OF THIS EMAIL: {objective}
+TONE: {tone}
+
+STRICT RULES (breaking any rule makes the email unusable):
+1. Use ONLY the facts in FACTS. Do not invent amounts, dates, percentages, plan names,
+   services, benefits, codes or links.
+2. {content_rule}
+3. Never mention: churn, risk, segment, score, usage drop, login history, analytics,
+   age, gender, family, payment method, or any internal field names.
+4. No pressure or threats: never say "act now", "last chance", "urgent", "legal action",
+   "collections", "disconnect", "penalty", "late fee", "credit score".
+5. Do NOT write any disclaimer, unsubscribe text, or dispute/support text. It is added automatically.
+6. Subject: max {subject_max} characters, no emojis, no ALL CAPS, no exclamation marks.
+7. Body: max {body_max} words. Start with "Hi {first_name}," and end with
+   "Warm regards,\\nThe {company} Team". Plain text, no markdown, no placeholders.
 
 Return ONLY a JSON object: {{"subject": "...", "body": "..."}}"""
 
-HUMAN_PROMPT = """CUSTOMER:
-{customer_json}
+HUMAN_PROMPT = """FACTS:
+{facts_json}
 
-OFFER (approved; use exactly as described):
-{campaign_json}
-
-Write the personalized email now."""
-
-PROMPT = ChatPromptTemplate.from_messages(
-    [("system", SYSTEM_PROMPT), ("human", HUMAN_PROMPT)]
-)
+Write the email now."""
 
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 def _to_dict(row: Any) -> dict:
-    """Accept dicts, pandas Series, or namedtuples."""
     if hasattr(row, "to_dict"):
         return row.to_dict()
     if hasattr(row, "_asdict"):
         return row._asdict()
-    return dict(row)
-
-
-def _truthy(value: Any) -> bool:
-    return str(value).strip().lower() in {"true", "1", "yes", "y"}
+    return dict(row or {})
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -108,242 +96,260 @@ def _num(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _has_overdue_balance(c: Mapping) -> bool:
-    return (
-        str(c.get("status", "")).strip().lower() != "paid"
-        and _num(c.get("days_overdue")) > 0
-        and _num(c.get("amount_due")) > 0
-    )
+def _truthy(value: Any) -> bool:
+    return str(value).strip().lower() in {"true", "1", "yes", "y"}
 
 
-def _customer_context(c: Mapping) -> dict:
-    """Keep only the fields useful for personalization."""
+def _money(c: Mapping) -> str:
+    return f"${_num(c.get('amount_due')):.2f}"
+
+
+def _facts(c: Mapping, message_type: str, offer: Mapping | None, stage: Mapping | None) -> dict:
+    """Minimal, non-sensitive facts the model may use (no protected attributes)."""
     tenure = int(_num(c.get("tenure")))
-    ctx = {
+    facts: dict[str, Any] = {
         "first_name": c.get("first_name") or "there",
-        "tenure_months": tenure,
-        "tenure_years": round(tenure / 12, 1),
+        "months_with_us": tenure,
         "loyalty_tier": c.get("loyalty_tier"),
         "contract": c.get("Contract"),
-        "internet_service": c.get("InternetService"),
-        "autopay_enabled": _truthy(c.get("autopay")),
     }
-    if _has_overdue_balance(c):
-        ctx.update(
-            {
-                "outstanding_balance": f"{c.get('currency', 'USD')} {_num(c.get('amount_due')):.2f}",
-                "balance_due_date": c.get("due_date"),
-            }
-        )
-    return {k: v for k, v in ctx.items() if k not in INTERNAL_FIELDS and v not in (None, "")}
+    if message_type == "offer" and offer:
+        facts["offer"] = {k: offer.get(k) for k in
+                          ("offer_name", "offer_value", "description", "terms") if offer.get(k)}
+    if message_type == "reminder":
+        facts["bill"] = {
+            "bill_id": c.get("bill_id"),
+            "amount_due": _money(c),
+            "due_date": str(c.get("due_date")),
+            "days_overdue": int(_num(c.get("days_overdue"))),
+            "autopay_enabled": _truthy(c.get("autopay")),
+        }
+        facts["reminder_stage"] = stage["name"] if stage else None
+    return facts
 
 
-def _campaign_context(o: Mapping) -> dict:
-    keys = ["offer_name", "offer_type", "offer_value", "description", "terms", "valid_to"]
-    return {k: o.get(k) for k in keys if o.get(k) not in (None, "")}
+def _content_rule(message_type: str, offer: Mapping | None, stage: Mapping | None) -> str:
+    if message_type == "offer":
+        return (f'Thank the customer and present the offer. Quote the offer value exactly as "{offer.get("offer_value")}". '
+                "Do not mention bills, balances or payments.")
+    if message_type == "no_offer":
+        return "Thank the customer for being with us. Do NOT mention any offer, discount, bill or payment."
+    days = int(stage["min_days_overdue"]) if stage else 0
+    rule = (f"State the bill ID, the amount due and the due date exactly as given in FACTS.bill. "
+            f"Ask the customer to pay or reply if they need help. Do not mention any offer.")
+    if days == 0:
+        rule += " The bill is not late yet; this is only a friendly heads-up."
+    if stage and stage["stage"] < 3:
+        rule += ' Do not use the words "final" or "final notice".'
+    else:
+        rule += " You may say this is a final reminder."
+    return rule
 
 
-def _balance_rule(c: Mapping) -> str:
-    if _has_overdue_balance(c):
-        return (
-            "The customer has an outstanding balance (given in CUSTOMER). Include ONE gentle, "
-            "non-judgmental sentence noting the balance amount and due date as a friendly reminder, "
-            "placed AFTER the offer. Do not imply the offer depends on payment. No threats or fees."
-        )
-    return "Do NOT mention bills, balances, payments, or overdue amounts at all."
-
-
-def _build_disclaimer(o: Mapping) -> str:
-    terms = str(o.get("terms", "")).strip()
-    if terms and not terms.endswith("."):
-        terms += "."
-    return STANDARD_DISCLAIMER.format(terms=terms, company=COMPANY_NAME).strip()
-
-
-def _allowed_numbers(c: Mapping, o: Mapping) -> set[str]:
-    """Numbers the model may legitimately use."""
-    sources = [
-        str(o.get("offer_value", "")), str(o.get("description", "")),
-        str(o.get("terms", "")), str(o.get("valid_to", "")),
-        str(c.get("tenure", "")), str(round(_num(c.get("tenure")) / 12, 1)),
-        str(int(_num(c.get("tenure")) // 12)),
-    ]
-    if _has_overdue_balance(c):
-        sources += [f"{_num(c.get('amount_due')):.2f}", str(c.get("amount_due")), str(c.get("due_date"))]
-    allowed = set()
+def _allowed_numbers(c: Mapping, offer: Mapping | None, message_type: str) -> set[str]:
+    sources = [str(int(_num(c.get("tenure")))), str(int(_num(c.get("tenure")) // 12))]
+    if offer and message_type == "offer":
+        sources += [str(offer.get(k, "")) for k in ("offer_value", "description", "terms", "valid_to", "offer_name")]
+    if message_type == "reminder":
+        sources += [_money(c), str(c.get("amount_due")), str(c.get("due_date")),
+                    str(int(_num(c.get("days_overdue")))), str(c.get("bill_id"))]
+    allowed: set[str] = set()
     for s in sources:
         allowed.update(re.findall(r"\d+(?:\.\d+)?", s))
     return allowed
 
 
-def _validate(draft: EmailDraft, c: Mapping, o: Mapping) -> list[str]:
+def _quick_validate(d: EmailDraft, c: Mapping, offer: Mapping | None, message_type: str) -> list[str]:
+    """Cheap checks used to trigger a retry. The full check is src.guardrails."""
     errors = []
-    subject, body = draft.subject.strip(), draft.body.strip()
+    subject, body = d.subject.strip(), d.body.strip()
     text = f"{subject}\n{body}"
-    lower = text.lower()
-
     if not subject or not body:
         errors.append("empty subject or body")
     if len(subject) > SUBJECT_MAX_CHARS:
-        errors.append(f"subject exceeds {SUBJECT_MAX_CHARS} chars")
+        errors.append(f"subject longer than {SUBJECT_MAX_CHARS} characters")
     if "!" in subject:
         errors.append("exclamation mark in subject")
     if len(body.split()) > BODY_MAX_WORDS:
-        errors.append(f"body exceeds {BODY_MAX_WORDS} words")
-    if re.search(r"https?://|www\.", lower):
-        errors.append("contains a link")
-    if re.search(r"\[[^\]]+\]|\{[^}]+\}", text):
-        errors.append("contains unfilled placeholder")
-
-    for phrase in BANNED_PHRASES:
-        if phrase in lower:
-            errors.append(f"banned phrase: '{phrase}'")
-
-    offer_value = str(o.get("offer_value", "")).strip()
-    if offer_value and offer_value.lower() not in lower:
-        errors.append(f"offer value '{offer_value}' not quoted exactly")
-
-    first_name = str(c.get("first_name") or "").strip()
-    if first_name and first_name.lower() not in body.lower():
-        errors.append("customer first name missing")
-
-    allowed = _allowed_numbers(c, o)
+        errors.append(f"body longer than {BODY_MAX_WORDS} words")
+    first = str(c.get("first_name") or "").strip()
+    if first and first.lower() not in body.lower():
+        errors.append("first name missing")
+    if message_type == "offer" and offer:
+        val = str(offer.get("offer_value", "")).strip()
+        if val and val.lower() not in text.lower():
+            errors.append(f"offer value '{val}' not quoted exactly")
+    if message_type == "reminder":
+        if _money(c) not in text:
+            errors.append(f"amount {_money(c)} not stated exactly")
+        if str(c.get("bill_id")) not in text:
+            errors.append("bill ID missing")
+    allowed = _allowed_numbers(c, offer, message_type)
     for n in re.findall(r"\d+(?:\.\d+)?", text):
         if n not in allowed:
-            errors.append(f"unverified number: {n}")
-
-    if not _has_overdue_balance(c) and re.search(r"\b(overdue|balance|past due|outstanding)\b", lower):
-        errors.append("mentions balance for customer with no overdue amount")
-
-    if re.search(r"\b(unsubscribe|reply stop|terms and conditions)\b", lower):
-        errors.append("model wrote its own disclaimer")
-
+            errors.append(f"unverified number {n}")
     return errors
 
 
 def _parse(raw: str) -> EmailDraft:
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not match:
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
         raise ValueError("no JSON object in model output")
-    return EmailDraft(**json.loads(match.group(0)))
+    return EmailDraft(**json.loads(m.group(0)))
 
 
-def _fallback_email(c: Mapping, o: Mapping) -> EmailDraft:
-    """Deterministic, compliant template used if the LLM cannot pass validation."""
+# --------------------------------------------------------------------------- #
+# Deterministic templates (used when no LLM or LLM fails)
+# --------------------------------------------------------------------------- #
+def _template(c: Mapping, message_type: str, segment: str, offer: Mapping | None, stage: Mapping | None) -> EmailDraft:
     name = c.get("first_name") or "there"
     tenure = int(_num(c.get("tenure")))
-    tenure_line = (
-        f"Thank you for being with us for {tenure} months." if tenure >= 1
-        else "Thank you for choosing us."
-    )
-    body = (
-        f"Hi {name},\n\n{tenure_line} As a thank-you, we'd like to offer you "
-        f"{o.get('offer_name')}: {o.get('description')}\n"
-    )
-    if _has_overdue_balance(c):
-        body += (
-            f"\nAs a friendly reminder, your balance of {c.get('currency', 'USD')} "
-            f"{_num(c.get('amount_due')):.2f} was due on {c.get('due_date')}.\n"
-        )
-    body += f"\nWarm regards,\nThe {COMPANY_NAME} Team"
-    subject = f"A thank-you from {COMPANY_NAME}: {o.get('offer_value')}"[:SUBJECT_MAX_CHARS]
-    return EmailDraft(subject=subject, body=body)
+    sign = f"\n\nWarm regards,\nThe {COMPANY_NAME} Team"
+    thanks = f"Thank you for being with us for {tenure} months." if tenure >= 1 else "Thank you for choosing us."
+
+    if message_type == "reminder":
+        s = stage["stage"] if stage else 1
+        bill, amt, due = c.get("bill_id"), _money(c), c.get("due_date")
+        if s == 0:
+            subject = f"Your bill {bill} is coming due"
+            body = (f"Hi {name},\n\nJust a friendly heads-up that your bill {bill} for {amt} is due on {due}. "
+                    "If you have autopay or have already paid, there is nothing more to do.")
+        elif s == 1:
+            subject = f"A quick reminder about bill {bill}"
+            body = (f"Hi {name},\n\nWe noticed your bill {bill} for {amt}, due on {due}, has not been paid yet. "
+                    "It may simply have slipped through. Please pay when you can, or reply if you need any help.")
+        elif s == 2:
+            subject = f"Payment needed for bill {bill}"
+            body = (f"Hi {name},\n\nYour bill {bill} for {amt} was due on {due} and is still unpaid. "
+                    "Please make the payment as soon as possible. If something is stopping you from paying, "
+                    "reply to this email and our team will help you find a way forward.")
+        else:
+            subject = f"Final reminder: bill {bill}"
+            body = (f"Hi {name},\n\nThis is a final reminder that your bill {bill} for {amt}, due on {due}, "
+                    "remains unpaid. Please pay it now, or contact us so we can talk through options with you.")
+        return EmailDraft(subject=subject, body=body + sign)
+
+    if message_type == "offer" and offer:
+        if segment in {"Declining", "Dormant"}:
+            subject = f"Something for you from {COMPANY_NAME}: {offer.get('offer_value')}"
+            body = f"Hi {name},\n\n{thanks} {offer.get('description')}"
+        else:
+            subject = f"A thank-you from {COMPANY_NAME}: {offer.get('offer_value')}"
+            body = f"Hi {name},\n\n{thanks} As a thank-you: {offer.get('description')}"
+        return EmailDraft(subject=subject[:SUBJECT_MAX_CHARS], body=body + sign)
+
+    subject = f"Thank you from {COMPANY_NAME}"
+    body = (f"Hi {name},\n\n{thanks} We are glad to have you with us. "
+            "If there is anything we can help with, just reply to this email.")
+    return EmailDraft(subject=subject, body=body + sign)
+
+
+def build_footer(message_type: str, offer: Mapping | None) -> str:
+    footers = POLICY["footers"]
+    if message_type == "reminder":
+        return footers["reminder"].format(support_email=SUPPORT_EMAIL, company=COMPANY_NAME)
+    if message_type == "offer" and offer:
+        terms = str(offer.get("terms", "")).strip()
+        if terms and not terms.endswith("."):
+            terms += "."
+        return footers["offer"].format(terms=terms, company=COMPANY_NAME)
+    return footers["no_offer"].format(company=COMPANY_NAME)
+
+
+_LLM_CACHE: dict[str, Any] = {}
+
+
+def get_llm():
+    """Return a ChatGroq client, or None if no API key is configured."""
+    if not os.getenv("GROQ_API_KEY"):
+        return None
+    if "llm" not in _LLM_CACHE:
+        from langchain_groq import ChatGroq
+        _LLM_CACHE["llm"] = ChatGroq(model=GROQ_MODEL, temperature=0.3, max_tokens=600)
+    return _LLM_CACHE["llm"]
 
 
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
-def generate_customer_email(customer_row: Any, campaign_row: Any, llm: ChatGroq | None = None) -> dict:
+def generate_email(
+    customer_row: Any,
+    *,
+    segment: str,
+    message_type: str,
+    objective: str,
+    tone: str,
+    offer: Mapping | None = None,
+    stage: Mapping | None = None,
+    llm: Any = "auto",
+) -> dict:
     """
-    Generate a personalized, compliant email for one customer and one approved offer.
-
-    Args:
-        customer_row: dict / pandas Series with customer fields
-                      (first_name, tenure, loyalty_tier, amount_due, days_overdue, status, ...).
-        campaign_row: dict / pandas Series with offer fields
-                      (offer_name, offer_value, description, terms, status, ...).
-        llm: optional pre-built ChatGroq client (reuse across calls).
-
-    Returns:
-        {"subject", "body", "disclaimer", "full_email", "source", "validation_errors"}
-        source is "llm" or "fallback_template".
+    Generate one draft. Returns:
+      subject, body, footer, full_email, source ("llm" | "template"),
+      model, prompt_version, template_version, attempts, llm_errors
     """
-    customer = _to_dict(customer_row)
-    campaign = _to_dict(campaign_row)
+    c = _to_dict(customer_row)
+    offer = _to_dict(offer) if offer is not None else None
+    if message_type == "offer" and not offer:
+        message_type = "no_offer"
+    if llm == "auto":
+        llm = get_llm()
 
-    # Hard pre-checks: never generate for non-approved offers or non-consenting customers.
-    if str(campaign.get("status", "active")).strip().lower() != "active":
-        raise ValueError(f"Campaign {campaign.get('offer_id')} is not approved/active.")
-    if _truthy(campaign.get("requires_marketing_consent", False)) and not _truthy(
-        customer.get("marketing_opt_in", False)
-    ):
-        raise PermissionError(f"Customer {customer.get('customerID')} has not given marketing consent.")
-    if not _truthy(customer.get("email_opt_in", True)):
-        raise PermissionError(f"Customer {customer.get('customerID')} has opted out of email.")
-
-    llm = llm or ChatGroq(model=GROQ_MODEL, temperature=0.3, max_tokens=600)
-    chain = PROMPT | llm
-
-    inputs = {
-        "company": COMPANY_NAME,
-        "offer_value": campaign.get("offer_value", ""),
-        "first_name": customer.get("first_name") or "there",
-        "balance_rule": _balance_rule(customer),
-        "subject_max": SUBJECT_MAX_CHARS,
-        "body_max": BODY_MAX_WORDS,
-        "customer_json": json.dumps(_customer_context(customer), indent=2, default=str),
-        "campaign_json": json.dumps(_campaign_context(campaign), indent=2, default=str),
-    }
-
-    draft, errors, source = None, [], "llm"
-    for _ in range(MAX_ATTEMPTS):
-        try:
-            candidate = _parse(chain.invoke(inputs).content)
-            errors = _validate(candidate, customer, campaign)
-        except Exception as exc:  # parsing / API errors
-            candidate, errors = None, [f"generation error: {exc}"]
-        if candidate and not errors:
-            draft = candidate
-            break
-        # Feed violations back for a corrective retry.
-        inputs["customer_json"] += (
-            "\n\nYOUR PREVIOUS DRAFT WAS REJECTED FOR: " + "; ".join(errors) + ". Fix these issues."
-        )
+    draft, errors, source, attempts = None, [], "template", 0
+    if llm is not None:
+        from langchain_core.prompts import ChatPromptTemplate
+        chain = ChatPromptTemplate.from_messages([("system", SYSTEM_PROMPT), ("human", HUMAN_PROMPT)]) | llm
+        inputs = {
+            "company": COMPANY_NAME,
+            "objective": objective,
+            "tone": stage["tone"] if (message_type == "reminder" and stage) else tone,
+            "content_rule": _content_rule(message_type, offer, stage),
+            "first_name": c.get("first_name") or "there",
+            "subject_max": SUBJECT_MAX_CHARS,
+            "body_max": BODY_MAX_WORDS,
+            "facts_json": json.dumps(_facts(c, message_type, offer, stage), indent=2, default=str),
+        }
+        for _ in range(MAX_ATTEMPTS):
+            attempts += 1
+            try:
+                candidate = _parse(chain.invoke(inputs).content)
+                errors = _quick_validate(candidate, c, offer, message_type)
+            except Exception as exc:  # API / parsing errors
+                candidate, errors = None, [f"generation error: {exc}"]
+            if candidate and not errors:
+                draft, source = candidate, "llm"
+                break
+            inputs["facts_json"] += "\n\nYOUR PREVIOUS DRAFT WAS REJECTED FOR: " + "; ".join(errors) + ". Fix these."
 
     if draft is None:
-        draft, source = _fallback_email(customer, campaign), "fallback_template"
+        draft = _template(c, message_type, segment, offer, stage)
 
-    disclaimer = _build_disclaimer(campaign)
+    footer = build_footer(message_type, offer)
     body = draft.body.strip()
     return {
         "subject": draft.subject.strip(),
         "body": body,
-        "disclaimer": disclaimer,
-        "full_email": f"{body}\n\n---\n{disclaimer}",
+        "footer": footer,
+        "full_email": f"{body}\n\n---\n{footer}",
+        "message_type": message_type,
         "source": source,
-        "validation_errors": errors if source == "fallback_template" else [],
+        "model": GROQ_MODEL if source == "llm" else "none (template)",
+        "prompt_version": PROMPT_VERSION,
+        "template_version": TEMPLATE_VERSION,
+        "attempts": attempts,
+        "llm_errors": errors if source == "template" else [],
     }
 
 
-# --------------------------------------------------------------------------- #
-# Example
-# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     customer = {
-        "customerID": "5575-GNVDE", "first_name": "Arjun", "tenure": 34,
-        "loyalty_tier": "Silver", "Contract": "One year", "InternetService": "DSL",
-        "amount_due": 56.95, "currency": "USD", "due_date": "2026-11-08",
-        "status": "Unpaid", "days_overdue": 9, "autopay": "False",
-        "email_opt_in": "True", "marketing_opt_in": "True",
+        "customerID": "5575-GNVDE", "first_name": "Arjun", "tenure": 34, "loyalty_tier": "Silver",
+        "Contract": "One year", "amount_due": 56.95, "due_date": "2026-11-08", "bill_id": "B100001",
+        "status": "Overdue", "days_overdue": 9,
     }
-    campaign = {
-        "offer_id": "OFF-LOY-SILV-01", "offer_name": "Silver Loyalty Credit",
-        "offer_type": "reward", "offer_value": "$10 credit",
-        "description": "As a Silver customer, you get a $10 credit on your next bill.",
-        "terms": "Credit applied to your next bill. Redeem by 31 Jan 2027. One per customer.",
-        "valid_to": "2027-01-31", "requires_marketing_consent": "True", "status": "active",
-    }
-    result = generate_customer_email(customer, campaign)
-    print("SUBJECT:", result["subject"])
-    print(result["full_email"])
-    print("SOURCE:", result["source"])
+    from src.policy import reminder_stage_for
+    out = generate_email(customer, segment="Payment Reminder", message_type="reminder",
+                         objective="Billing reminder", tone="", stage=reminder_stage_for(9))
+    print(out["subject"])
+    print(out["full_email"])
+    print("SOURCE:", out["source"])

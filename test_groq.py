@@ -17,7 +17,7 @@ print("API key detected successfully!")
 
 # Connect to Groq
 llm = ChatGroq(
-    model="openai/gpt-oss-120b",
+    model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
     temperature=0,
     groq_api_key=api_key
 )
